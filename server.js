@@ -6,7 +6,6 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// PENTING: Ganti URL ini sesuai dengan URL Laravel lokal Anda
 const LARAVEL_API_URL = 'http://127.0.0.1:8000/api/webhook/whatsapp'; 
 const SECRET_TOKEN = 'SITABA_PROTOTYPE_SECRET_2026';
 
@@ -14,7 +13,7 @@ async function startBot() {
 const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const express = require('express');
 const axios = require('axios');
-const qrcode = require('qrcode-terminal'); // Hore, kita tambahkan ini!
+const qrcode = require('qrcode-terminal');
 const app = express();
 const PORT = 3000;
 
@@ -28,7 +27,6 @@ async function startBot() {
         
         const sock = makeWASocket({
             auth: state,
-            // Hapus opsi printQRInTerminal: true yang lama karena sudah deprecated
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -101,7 +99,6 @@ async function startBot() {
     });
 }
 
-// Jalankan Express untuk keperluan monitoring port (opsional)
 app.listen(PORT, () => {
     console.log(`Server Bot running di port ${PORT}`);
     startBot();
