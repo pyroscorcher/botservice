@@ -6,7 +6,7 @@ const PORT = 3000;
 
 app.use(express.json());
 
-const LARAVEL_API_URL = 'http://127.0.0.1:8000/api/webhook/whatsapp'; 
+const LARAVEL_API_URL = 'http://127.0.0.1:8000/webhook/whatsapp'; 
 const SECRET_TOKEN = 'SITABA_PROTOTYPE_SECRET_2026';
 
 async function startBot() {
@@ -19,7 +19,7 @@ const PORT = 3000;
 
 app.use(express.json());
 
-const LARAVEL_API_URL = 'http://127.0.0.1:8000/api/webhook/whatsapp'; 
+const LARAVEL_API_URL = 'http://127.0.0.1:8000/webhook/whatsapp'; 
 const SECRET_TOKEN = 'SITABA_PROTOTYPE_SECRET_2026';
 
 async function startBot() {
@@ -51,40 +51,51 @@ async function startBot() {
             }
         });
 
-    // Mendengarkan pesan WhatsApp masuk
+        // Mendengarkan pesan WhatsApp masuk
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
             if (!msg.message || msg.key.fromMe) return;
 
-            const senderNumber = msg.key.remoteJid; // Contoh format: '628123456789@s.whatsapp.net' atau '120363234@g.us'
+            const senderNumber = msg.key.remoteJid; // Bisa berupa @s.whatsapp.net, @lid, atau @g.us
 
-            // 🔥 FILTER HANYA UNTUK PERSONAL CHAT
-            if (!senderNumber.endsWith('@s.whatsapp.net')) {
+            // 🔥 FILTER BARU: Blokir jika berupa Grup atau Broadcast
+            if (senderNumber.endsWith('@g.us') || senderNumber.endsWith('@broadcast')) {
                 console.log(`[Diabaikan] Pesan masuk dari Grup/Broadcast: ${senderNumber}`);
                 return; 
             }
 
-            const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
-            if (!textMessage) return;
+            // Jika lolos seleksi di atas, berarti ini 100% Personal Chat (baik tipe @s.whatsapp.net maupun @lid)
+            const textMessage = 
+                msg.message.conversation || 
+                msg.message.extendedTextMessage?.text || 
+                msg.message.buttonsResponseMessage?.selectedButtonId || 
+                msg.message.templateButtonReplyMessage?.selectedId ||
+                '';
 
-            console.log(`Pesan masuk dari Personal Chat [${senderNumber}]: ${textMessage}`);
+            if (!textMessage.trim()) {
+                console.log(`[Diabaikan] Pesan dari ${senderNumber} bukan tipe teks.`);
+                return;
+            }
 
-            // FORMAT SIMPEL PROTOTIPE: "Lapor: [Deskripsi Bencana] | Lokasi: [Nama Kabupaten/Kota]"
+            console.log(`[Personal Chat Lolos] Dari [${senderNumber}]: ${textMessage}`);
+
+            // LOGIKA OPERASIONAL SITABA
             if (textMessage.toLowerCase().startsWith('lapor:')) {
                 try {
                     const bagian = textMessage.split('|');
                     const deskripsi = bagian[0].replace(/lapor:/i, '').trim();
                     const lokasiRaw = bagian[1] ? bagian[1].replace(/lokasi:/i, '').trim() : 'Lokasi tidak disebutkan';
 
-                    // Balas pesan ke warga
+                    // Mengirim balasan teks ke user (Baileys otomatis mendukung pengiriman ke @lid maupun @s.whatsapp.net)
                     await sock.sendMessage(senderNumber, { 
                         text: 'Terima kasih, laporan Anda telah diterima oleh sistem SITABA.' 
                     });
 
                     // Tembak data ke Laravel API
+                    // Catatan: `.split('@')[0]` akan mengambil string ID/Nomor di depan tanda @
                     await axios.post(LARAVEL_API_URL, {
                         token: SECRET_TOKEN,
-                        nomor_pelapor: senderNumber.split('@')[0], // Mengambil digit nomor hp saja
+                        nomor_pelapor: senderNumber.split('@')[0], 
                         deskripsi: deskripsi,
                         kabupaten: lokasiRaw,
                         status_laporan: 'Baru'
@@ -95,7 +106,6 @@ async function startBot() {
                     console.error('❌ Gagal meneruskan laporan ke Laravel:', error.message);
                 }
             } else {
-                // Memberikan instruksi format jika pesan personal tidak diawali kata 'lapor:'
                 await sock.sendMessage(senderNumber, { 
                     text: 'Selamat datang di Call Center SITABA.\n\nUntuk melaporkan bencana, gunakan format berikut:\n*Lapor:* [Isi Laporan Bencana] | *Lokasi:* [Nama Kabupaten/Kota]' 
                 });
