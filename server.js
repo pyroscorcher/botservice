@@ -3,6 +3,9 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 const PORT = 3000;
+const fs = require('fs');
+const path = require('path');
+const FormData = require('form-data');
 
 app.use(express.json());
 
@@ -55,63 +58,101 @@ async function startBot() {
         sock.ev.on('messages.upsert', async (m) => {
             const msg = m.messages[0];
             if (!msg.message || msg.key.fromMe) return;
-
-            const senderNumber = msg.key.remoteJid; // Bisa berupa @s.whatsapp.net, @lid, atau @g.us
-
-            // 🔥 FILTER BARU: Blokir jika berupa Grup atau Broadcast
+            const senderNumber = msg.key.remoteJid;
             if (senderNumber.endsWith('@g.us') || senderNumber.endsWith('@broadcast')) {
                 console.log(`[Diabaikan] Pesan masuk dari Grup/Broadcast: ${senderNumber}`);
                 return; 
             }
 
-            // Jika lolos seleksi di atas, berarti ini 100% Personal Chat (baik tipe @s.whatsapp.net maupun @lid)
-            const textMessage = 
-                msg.message.conversation || 
-                msg.message.extendedTextMessage?.text || 
-                msg.message.buttonsResponseMessage?.selectedButtonId || 
-                msg.message.templateButtonReplyMessage?.selectedId ||
-                '';
+// Define main references
+    const messageType = Object.keys(msg.message)[0]; // e.g., 'conversation', 'locationMessage', 'imageMessage'
+    let textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+    let latitude = null;
+    let longitude = null;
+    let mediaBuffer = null;
+    let mediaExtension = '';
+    let mediaMimeType = '';
 
-            if (!textMessage.trim()) {
-                console.log(`[Diabaikan] Pesan dari ${senderNumber} bukan tipe teks.`);
-                return;
-            }
-
-            console.log(`[Personal Chat Lolos] Dari [${senderNumber}]: ${textMessage}`);
-
-            // LOGIKA OPERASIONAL SITABA
-            if (textMessage.toLowerCase().startsWith('lapor:')) {
-                try {
-                    const bagian = textMessage.split('|');
-                    const deskripsi = bagian[0].replace(/lapor:/i, '').trim();
-                    const lokasiRaw = bagian[1] ? bagian[1].replace(/lokasi:/i, '').trim() : 'Lokasi tidak disebutkan';
-
-                    // Mengirim balasan teks ke user (Baileys otomatis mendukung pengiriman ke @lid maupun @s.whatsapp.net)
-                    await sock.sendMessage(senderNumber, { 
-                        text: 'Terima kasih, laporan Anda telah diterima oleh sistem SITABA.' 
-                    });
-
-                    // Tembak data ke Laravel API
-                    // Catatan: `.split('@')[0]` akan mengambil string ID/Nomor di depan tanda @
-                    await axios.post(LARAVEL_API_URL, {
-                        token: SECRET_TOKEN,
-                        nomor_pelapor: senderNumber.split('@')[0], 
-                        deskripsi: deskripsi,
-                        kabupaten: lokasiRaw,
-                        status_laporan: 'Baru'
-                    });
-
-                    console.log('👉 Laporan personal berhasil diteruskan ke Laravel!');
-                } catch (error) {
-                    console.error('❌ Gagal meneruskan laporan ke Laravel:', error.message);
-                }
-            } else {
-                await sock.sendMessage(senderNumber, { 
-                    text: 'Selamat datang di Call Center SITABA.\n\nUntuk melaporkan bencana, gunakan format berikut:\n*Lapor:* [Isi Laporan Bencana] | *Lokasi:* [Nama Kabupaten/Kota]' 
-                });
-            }
-        });
+    // 📍 1. HANDLE LOCATION SHARING
+    if (messageType === 'locationMessage') {
+        const location = msg.message.locationMessage;
+        latitude = location.degreesLatitude;
+        longitude = location.degreesLongitude;
+        textMessage = `[Shared Location] - Coordinates: ${latitude}, ${longitude}`;
+        console.log(`📍 Location received from ${senderNumber}: ${latitude}, ${longitude}`);
     }
+
+    // 🖼️ 2. HANDLE IMAGE SHARING
+    else if (messageType === 'imageMessage') {
+        const imageMessage = msg.message.imageMessage;
+        textMessage = imageMessage.caption || '[Image Laporan Bencana]'; // Captions count as the text description
+        mediaMimeType = imageMessage.mimetype;
+        mediaExtension = '.jpg';
+        
+        // Decrypt image payload
+        const stream = await downloadContentFromMessage(imageMessage, 'image');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
+        }
+        mediaBuffer = buffer;
+        console.log(`🖼️ Image received with caption: ${textMessage}`);
+    }
+
+    // 🎥 3. HANDLE VIDEO SHARING
+    else if (messageType === 'videoMessage') {
+        const videoMessage = msg.message.videoMessage;
+        textMessage = videoMessage.caption || '[Video Laporan Bencana]';
+        mediaMimeType = videoMessage.mimetype;
+        mediaExtension = '.mp4';
+
+        // Decrypt video payload
+        const stream = await downloadContentFromMessage(videoMessage, 'video');
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
+        }
+        mediaBuffer = buffer;
+        console.log(`🎥 Video received with caption: ${textMessage}`);
+    }
+
+        // Only proceed if it is a structured command or rich payload
+        if (textMessage.toLowerCase().startsWith('lapor:') || messageType === 'locationMessage' || mediaBuffer) {
+            try {
+                // Using FormData so we can easily stream binary attachments to Laravel
+                const formData = new FormData();
+                formData.append('token', SECRET_TOKEN);
+                formData.append('nomor_pelapor', senderNumber.split('@')[0]);
+                formData.append('deskripsi', textMessage);
+                
+                if (latitude && longitude) {
+                    formData.append('latitude', latitude.toString());
+                    formData.append('longitude', longitude.toString());
+                }
+
+                if (mediaBuffer) {
+                    formData.append('media_file', mediaBuffer, {
+                        filename: `report_${Date.now()}${mediaExtension}`,
+                        contentType: mediaMimeType
+                    });
+                }
+
+                // Post Multipart/Form-Data payload directly to Laravel
+                await axios.post(LARAVEL_API_URL, formData, {
+                    headers: formData.getHeaders()
+                });
+
+                await sock.sendMessage(senderNumber, { 
+                    text: 'Terima kasih, data laporan (termasuk koordinat/media jika ada) telah disimpan ke Dashboard SITABA.' 
+                });
+                console.log('👉 Rich report payload successfully pushed to Laravel!');
+
+            } catch (error) {
+                console.error('❌ Failed to route rich payload to Laravel:', error.message);
+            }
+        }
+    });
+}
 
     app.listen(PORT, () => {
         console.log(`Server Bot running di port ${PORT}`);
