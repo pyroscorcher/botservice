@@ -82,6 +82,7 @@ const FORMAT_TEMPLATE =
     'Untuk melaporkan bencana, silahkan balas pesan ini dengan format berikut ' +
     '(pastikan setiap bagian dipisahkan tanda "|"):\n\n' +
     'Nama Pelapor : [Isi Nama Pelapor] | ' +
+    'Nomor Telepon : [Nomor telepon yang bisa dihubungi] | ' +
     'Waktu Kejadian : [Waktu dan tanggal kejadian] | ' +
     'Lokasi Kejadian : [Alamat detail kejadian] | ' +
     'Deskripsi : [Deskripsi kejadian] | ' +
@@ -98,7 +99,7 @@ function namaBencanaPrompt(jenisBencana) {
 }
 
 function dampakBencanaPrompt() {
-    return `Pilih Dampak Bencana (balas dengan nomor):\n\n${numberedList(DAMPAK_BENCANA)}`;
+    return `Pilih Dampak Bencana — bisa lebih dari satu, pisahkan dengan koma (contoh: 1,3):\n\n${numberedList(DAMPAK_BENCANA)}`;
 }
 
 function wilayahWaktuPrompt() {
@@ -120,6 +121,7 @@ const FOTO_PROMPT =
 // column it fills.
 const LABEL_TO_FIELD = {
     'namapelapor': 'pelapor',
+    'nomortelepon': 'telepon',
     'waktukejadian': 'waktu_kejadian',
     'lokasikejadian': 'lokasi',
     'deskripsi': 'deskripsi',
@@ -162,6 +164,24 @@ function parseChoice(text, list) {
     const n = parseInt(text.trim(), 10);
     if (Number.isNaN(n) || n < 1 || n > list.length) return null;
     return n - 1;
+}
+
+/**
+ * Parses a reply like "1,3" or "1 3" into multiple items from the given list.
+ * Returns the selected items (deduped, in list order) or null if anything is invalid.
+ */
+function parseMultipleChoices(text, list) {
+    const parts = text.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+    if (parts.length === 0) return null;
+
+    const indices = new Set();
+    for (const part of parts) {
+        const n = parseInt(part, 10);
+        if (Number.isNaN(n) || n < 1 || n > list.length) return null;
+        indices.add(n - 1);
+    }
+
+    return [...indices].sort((a, b) => a - b).map((i) => list[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,12 +310,14 @@ async function startBot() {
                 }
 
                 case 'awaiting_dampak_bencana': {
-                    const index = parseChoice(textMessage, DAMPAK_BENCANA);
-                    if (index === null) {
-                        await reply('Nomor tidak valid. ' + dampakBencanaPrompt());
+                    const selected = parseMultipleChoices(textMessage, DAMPAK_BENCANA);
+                    if (!selected) {
+                        await reply('Pilihan tidak valid. ' + dampakBencanaPrompt());
                         return;
                     }
-                    session.data.dampak_bencana = DAMPAK_BENCANA[index];
+                    // dampak_bencana is a single varchar column, so multiple
+                    // selections are joined into one comma-separated string.
+                    session.data.dampak_bencana = selected.join(', ');
                     session.step = 'awaiting_wilayah_waktu';
                     await reply(wilayahWaktuPrompt());
                     return;
@@ -364,6 +386,7 @@ async function startBot() {
         const fields = {
             token: SECRET_TOKEN,
             pelapor: data.pelapor,
+            telepon: data.telepon,
             jenis_bencana: data.jenis_bencana,
             nama_bencana: data.nama_bencana,
             dampak_bencana: data.dampak_bencana,
