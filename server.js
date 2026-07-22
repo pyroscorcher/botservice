@@ -32,9 +32,6 @@ const JENIS_BENCANA = [
     'Tsunami',
 ];
 
-// Sub-types per jenis_bencana. "Kebakaran Gedung dan Pemukiman" has no
-// sub-list, so it's intentionally omitted here — the flow skips straight
-// to Dampak Bencana for that category (see handleJenisBencana below).
 const NAMA_BENCANA_MAP = {
     'Gagal Teknologi': ['Kegagalan Industri', 'Kecelakaan Industri'],
     'Epidemi dan Wabah Penyakit': ['Epidemi', 'Wabah Penyakit'],
@@ -57,15 +54,14 @@ const WILAYAH_WAKTU = ['WIB', 'WITA', 'WIT'];
 // ---------------------------------------------------------------------------
 // Session store
 // ---------------------------------------------------------------------------
-// In-memory only — sessions reset if the server restarts. Fine for a
-// prototype; for production, swap this Map for a database table or Redis
-// so an in-progress report survives a bot restart.
 const sessions = new Map();
 
 function newSession() {
     return {
-        step: 'awaiting_format', // awaiting_format -> awaiting_jenis_bencana -> awaiting_nama_bencana -> awaiting_dampak_bencana -> awaiting_wilayah_waktu -> done
-        data: {},
+        step: 'awaiting_format',
+        data: {
+            fotos: [] // Menyiapkan array kosong untuk menampung multi-foto
+        },
     };
 }
 
@@ -106,19 +102,18 @@ function wilayahWaktuPrompt() {
     return `Pilih Wilayah Waktu kejadian (balas dengan nomor):\n\n${numberedList(WILAYAH_WAKTU)}`;
 }
 
-// Keywords that let the reporter skip the optional photo step.
-const SKIP_KEYWORDS = ['lewati', 'skip', 'tidak', 'tidak ada', '-'];
+// Kata kunci untuk mengakhiri tahap pengiriman foto
+const SKIP_KEYWORDS = ['lewati', 'skip', 'tidak', 'tidak ada', '-', 'selesai', 'cukup', 'sudah'];
 
 const FOTO_PROMPT =
-    '(Opsional) Jika Anda memiliki foto kondisi lokasi kejadian, silahkan kirim sebagai gambar sekarang.\n\n' +
-    'Jika tidak ada foto, balas dengan mengetik "lewati".';
+    '(Opsional) Jika Anda memiliki foto kondisi lokasi kejadian, silahkan kirim sebagai gambar.\n' +
+    '*(Anda bisa mengirim lebih dari 1 foto secara bergantian)*.\n\n' +
+    'Jika sudah selesai mengirim foto, atau tidak ada foto, ketik: *"selesai"*.';
 
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-// Maps the normalized (lowercased, no-space) label to the Laporan Masyarakat
-// column it fills.
 const LABEL_TO_FIELD = {
     'namapelapor': 'pelapor',
     'nomortelepon': 'telepon',
@@ -131,11 +126,6 @@ const LABEL_TO_FIELD = {
 
 const REQUIRED_LABELS = Object.keys(LABEL_TO_FIELD);
 
-/**
- * Parses the pipe-delimited intake message.
- * Returns { pelapor, waktu_kejadian, lokasi, deskripsi, infrastruktur_terdampak, kebutuhan_mendesak }
- * or null if the message doesn't contain all required fields.
- */
 function parseFormatMessage(text) {
     const segments = text.split('|').map((s) => s.trim()).filter(Boolean);
     const result = {};
@@ -159,17 +149,12 @@ function parseFormatMessage(text) {
     return hasAllFields ? result : null;
 }
 
-/** Parses a numeric reply like "3" into a valid 0-based index for the given list, or null. */
 function parseChoice(text, list) {
     const n = parseInt(text.trim(), 10);
     if (Number.isNaN(n) || n < 1 || n > list.length) return null;
     return n - 1;
 }
 
-/**
- * Parses a reply like "1,3" or "1 3" into multiple items from the given list.
- * Returns the selected items (deduped, in list order) or null if anything is invalid.
- */
 function parseMultipleChoices(text, list) {
     const parts = text.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
     if (parts.length === 0) return null;
@@ -238,9 +223,6 @@ async function startBot() {
         const session = sessions.get(senderNumber);
         const awaitingFoto = session?.step === 'awaiting_foto';
 
-        // Ignore anything with no usable text UNLESS it's an image arriving
-        // during the optional photo step — that's the one case a non-text
-        // message is expected and needs to reach the switch below.
         if (!textMessage.trim() && !(hasImage && awaitingFoto)) {
             console.log(`[Diabaikan] Pesan dari ${senderNumber} bukan tipe teks.`);
             return;
@@ -250,8 +232,6 @@ async function startBot() {
 
         const reply = (text) => sock.sendMessage(senderNumber, { text });
 
-        // No active session yet -> this message is the trigger. Send the
-        // format template and start tracking this sender's progress.
         if (!session) {
             sessions.set(senderNumber, newSession());
             await reply(FORMAT_TEMPLATE);
@@ -287,8 +267,6 @@ async function startBot() {
                         session.step = 'awaiting_nama_bencana';
                         await reply(namaBencanaPrompt(jenisBencana));
                     } else {
-                        // No sub-list for this category (e.g. Kebakaran Gedung dan
-                        // Pemukiman) — use the category itself as nama_bencana.
                         session.data.nama_bencana = jenisBencana;
                         session.step = 'awaiting_dampak_bencana';
                         await reply(dampakBencanaPrompt());
@@ -315,8 +293,6 @@ async function startBot() {
                         await reply('Pilihan tidak valid. ' + dampakBencanaPrompt());
                         return;
                     }
-                    // dampak_bencana is a single varchar column, so multiple
-                    // selections are joined into one comma-separated string.
                     session.data.dampak_bencana = selected.join(', ');
                     session.step = 'awaiting_wilayah_waktu';
                     await reply(wilayahWaktuPrompt());
@@ -338,6 +314,7 @@ async function startBot() {
                 case 'awaiting_foto': {
                     const imageMessage = msg.message.imageMessage;
 
+                    // 1. Jika pesan berupa gambar, simpan ke array, lalu tahan (jangan di-submit)
                     if (imageMessage) {
                         const buffer = await downloadMediaMessage(
                             msg,
@@ -348,28 +325,32 @@ async function startBot() {
 
                         const mimetype = imageMessage.mimetype || 'image/jpeg';
                         const extension = mimetype.includes('png') ? 'png' : 'jpg';
-                        const filename = `foto_${Date.now()}.${extension}`;
+                        // Berikan nama unik untuk setiap foto
+                        const filename = `foto_${Date.now()}_${session.data.fotos.length + 1}.${extension}`;
 
-                        await submitLaporan(session.data, senderNumber, { buffer, filename, mimetype });
-                        await reply('Terima kasih, laporan beserta foto Anda telah diterima oleh sistem SITABA.');
-                        sessions.delete(senderNumber);
+                        // Simpan ke array state
+                        session.data.fotos.push({ buffer, filename, mimetype });
+
+                        await reply(`✅ Foto ke-${session.data.fotos.length} diterima.\n\nSilahkan kirim foto lainnya jika ada, atau balas dengan mengetik *"selesai"* untuk memproses laporan.`);
                         return;
                     }
 
+                    // 2. Jika pesan berupa teks "selesai" / "skip"
                     const isSkip = SKIP_KEYWORDS.includes(textMessage.trim().toLowerCase());
                     if (isSkip) {
-                        await submitLaporan(session.data, senderNumber, null);
-                        await reply('Terima kasih, laporan Anda telah diterima oleh sistem SITABA.');
+                        // Submit seluruh data beserta kumpulan foto yang mungkin sudah tersimpan di array
+                        await submitLaporan(session.data, senderNumber, session.data.fotos);
+                        await reply('Terima kasih, laporan beserta foto Anda telah berhasil dikirim ke sistem SITABA.');
                         sessions.delete(senderNumber);
                         return;
                     }
 
-                    await reply('Mohon kirim foto (gambar), atau ketik "lewati" jika tidak ada.\n\n' + FOTO_PROMPT);
+                    // 3. Jika pesan bukan gambar & bukan kata kunci pengakhir
+                    await reply('Mohon kirim foto (gambar), atau ketik *"selesai"* jika sudah selesai / tidak ada foto.\n\n' + FOTO_PROMPT);
                     return;
                 }
 
                 default: {
-                    // Shouldn't happen, but reset defensively if it does.
                     sessions.delete(senderNumber);
                     await reply(FORMAT_TEMPLATE);
                     return;
@@ -382,7 +363,7 @@ async function startBot() {
         }
     });
 
-    async function submitLaporan(data, senderNumber, photo) {
+    async function submitLaporan(data, senderNumber, fotos) {
         const fields = {
             token: SECRET_TOKEN,
             pelapor: data.pelapor,
@@ -400,23 +381,30 @@ async function startBot() {
         };
 
         try {
-            if (photo) {
-                // foto is optional — only sent when the reporter actually attaches an image.
+            if (fotos && fotos.length > 0) {
                 const form = new FormData();
+                
+                // Masukkan fields teks
                 for (const [key, value] of Object.entries(fields)) {
                     form.append(key, value ?? '');
                 }
-                form.append('foto', photo.buffer, {
-                    filename: photo.filename,
-                    contentType: photo.mimetype,
-                });
+
+                // Looping array untuk memasukkan banyak foto
+                // Perhatikan key menggunakan 'fotos[]' agar dikenali sebagai array oleh Laravel Request
+                for (const photo of fotos) {
+                    form.append('fotos[]', photo.buffer, {
+                        filename: photo.filename,
+                        contentType: photo.mimetype,
+                    });
+                }
 
                 await axios.post(LARAVEL_API_URL, form, { headers: form.getHeaders() });
             } else {
+                // Submit tanpa foto
                 await axios.post(LARAVEL_API_URL, fields);
             }
 
-            console.log(`👉 Laporan dari ${senderNumber} berhasil diteruskan ke Laravel!${photo ? ' (dengan foto)' : ''}`);
+            console.log(`👉 Laporan dari ${senderNumber} berhasil diteruskan ke Laravel! (Jumlah foto: ${fotos.length})`);
         } catch (error) {
             console.error('❌ Gagal meneruskan laporan ke Laravel:', error.message);
             throw error;
